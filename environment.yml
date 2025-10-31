@@ -1,0 +1,22 @@
+name: sem3dgs
+channels:
+  - pytorch
+  - conda-forge
+  - nvidia
+  - defaults
+dependencies:
+  - cudatoolkit=11.6
+  - cuda-nvcc=11.6
+  - cuda-cudart-dev=11.6
+  - plyfile
+  - python=3.7.13
+  - pip=22.3.1
+  - pytorch=1.12.1
+  - torchaudio=0.12.1
+  - torchvision=0.13.1
+  - tqdm
+  - pip:
+    - opencv-python
+    - joblib
+    - mediapy
+    - dreifus
