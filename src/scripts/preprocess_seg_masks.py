@@ -11,47 +11,56 @@ import argparse
 from tqdm import tqdm
 
 
-def collect_global_classes(input_dir, npy_files):
+def collect_global_classes_with_frequency(input_dir, npy_files):
     """
-    First pass: Collect ALL unique classes across ALL images.
-    This ensures consistent mapping across the entire dataset.
+    First pass: Collect ALL unique classes across ALL images WITH pixel counts.
+    This ensures we can map the most FREQUENT classes to dedicated slots.
     """
-    all_classes = set()
+    from collections import Counter
+    class_pixel_counts = Counter()
     
-    print("Pass 1: Collecting unique classes across all images...")
+    print("Pass 1: Collecting class frequencies across all images...")
     for npy_file in tqdm(npy_files, desc="Scanning"):
         mask_path = os.path.join(input_dir, npy_file)
         mask = np.load(mask_path)
-        all_classes.update(np.unique(mask).tolist())
+        unique, counts = np.unique(mask, return_counts=True)
+        for cls, cnt in zip(unique, counts):
+            class_pixel_counts[cls] += cnt
     
-    return sorted(all_classes)
+    return class_pixel_counts
 
 
-def create_global_mapping(all_classes, max_classes=10):
+def create_global_mapping(class_pixel_counts, max_classes=10):
     """
     Create a GLOBAL consistent mapping from original classes to 0-(max_classes-1).
     
-    Strategy:
-    - Class 0 stays as 0 (background)
-    - Other classes are mapped to 1-(max_classes-1) based on frequency/order
-    - Overflow classes are mapped to (max_classes-1)
+    Strategy (FREQUENCY-BASED):
+    - The top (max_classes) most frequent classes get their own dedicated slots 0-(max_classes-1)
+    - All other classes are mapped to (max_classes-1) as "other"
+    
+    This ensures semantically important (frequent) classes are preserved!
     """
     mapping = {}
     
-    # Background stays 0
-    if 0 in all_classes:
-        mapping[0] = 0
-        all_classes = [c for c in all_classes if c != 0]
+    # Sort classes by frequency (most frequent first)
+    sorted_classes = sorted(class_pixel_counts.keys(), 
+                           key=lambda c: class_pixel_counts[c], 
+                           reverse=True)
     
-    # Map remaining classes
-    for i, original_class in enumerate(all_classes):
-        if i >= max_classes - 1:  # Reserve class 0 for background
-            new_class = max_classes - 1  # Map overflow to last class
-        else:
-            new_class = i + 1
-        mapping[original_class] = new_class
+    # Top N classes get dedicated slots
+    top_classes = sorted_classes[:max_classes]
+    other_classes = sorted_classes[max_classes:]
     
-    return mapping
+    # Assign new IDs: most frequent = 0, second most = 1, etc.
+    for new_id, original_class in enumerate(top_classes):
+        mapping[original_class] = new_id
+    
+    # All remaining classes map to (max_classes - 1) as "other"
+    # But if we already have max_classes top classes, they share the last slot
+    for original_class in other_classes:
+        mapping[original_class] = max_classes - 1
+    
+    return mapping, top_classes, other_classes
 
 
 def apply_mapping(mask, global_mapping):
@@ -73,7 +82,7 @@ def apply_mapping(mask, global_mapping):
 
 
 def process_directory(input_dir, output_dir, max_classes=10, save_png=True, resize=None):
-    """Process all .npy files in input directory with GLOBAL consistent mapping."""
+    """Process all .npy files in input directory with GLOBAL consistent FREQUENCY-BASED mapping."""
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -91,19 +100,30 @@ def process_directory(input_dir, output_dir, max_classes=10, save_png=True, resi
         print(f"Resize to: {resize[0]}x{resize[1]}")
     print()
     
-    # PASS 1: Collect all unique classes globally
-    all_classes = collect_global_classes(input_dir, npy_files)
-    print(f"\nFound {len(all_classes)} unique classes across all images: {all_classes[:20]}{'...' if len(all_classes) > 20 else ''}")
+    # PASS 1: Collect all unique classes with FREQUENCY counts globally
+    class_pixel_counts = collect_global_classes_with_frequency(input_dir, npy_files)
+    total_pixels = sum(class_pixel_counts.values())
     
-    # Create GLOBAL mapping (same for ALL images!)
-    global_mapping = create_global_mapping(all_classes, max_classes)
+    print(f"\nFound {len(class_pixel_counts)} unique classes across all images")
     
-    print(f"\nGlobal class mapping (consistent across ALL images):")
-    for orig, new in sorted(global_mapping.items())[:15]:
-        print(f"  {orig:3d} → {new}")
-    if len(global_mapping) > 15:
-        print(f"  ... and {len(global_mapping) - 15} more")
-    print()
+    # Create GLOBAL FREQUENCY-BASED mapping (same for ALL images!)
+    global_mapping, top_classes, other_classes = create_global_mapping(class_pixel_counts, max_classes)
+    
+    print(f"\n{'='*60}")
+    print(f"FREQUENCY-BASED CLASS MAPPING (top {max_classes} most common classes)")
+    print(f"{'='*60}")
+    print(f"{'New ID':<8} {'Original ID':<12} {'Pixels':<15} {'% of Dataset':<12}")
+    print(f"{'-'*60}")
+    for new_id, orig_class in enumerate(top_classes):
+        pct = 100 * class_pixel_counts[orig_class] / total_pixels
+        print(f"{new_id:<8} {orig_class:<12} {class_pixel_counts[orig_class]:<15,} {pct:.2f}%")
+    
+    if other_classes:
+        other_pixels = sum(class_pixel_counts[c] for c in other_classes)
+        other_pct = 100 * other_pixels / total_pixels
+        print(f"{'-'*60}")
+        print(f"Classes merged into '{max_classes-1}' (other): {len(other_classes)} classes, {other_pixels:,} pixels ({other_pct:.2f}%)")
+    print(f"{'='*60}\n")
     
     # PASS 2: Apply mapping to all images
     print("Pass 2: Applying consistent mapping to all images...")
@@ -132,14 +152,25 @@ def process_directory(input_dir, output_dir, max_classes=10, save_png=True, resi
             output_png = os.path.join(output_dir, png_file)
             Image.fromarray(vis_mask).save(output_png)
     
-    # Save mapping for reference
+    # Save detailed mapping for reference
     mapping_file = os.path.join(output_dir, "class_mapping.txt")
     with open(mapping_file, 'w') as f:
-        f.write("# Global class mapping (original -> new)\n")
-        for orig, new in sorted(global_mapping.items()):
-            f.write(f"{orig} -> {new}\n")
+        f.write("# FREQUENCY-BASED Global Class Mapping\n")
+        f.write(f"# Total original classes: {len(class_pixel_counts)}\n")
+        f.write(f"# Mapped to: {max_classes} classes (0-{max_classes-1})\n")
+        f.write("#\n")
+        f.write("# Top classes (by pixel frequency):\n")
+        for new_id, orig_class in enumerate(top_classes):
+            pct = 100 * class_pixel_counts[orig_class] / total_pixels
+            f.write(f"{orig_class} -> {new_id}  # {class_pixel_counts[orig_class]:,} pixels ({pct:.2f}%)\n")
+        f.write("#\n")
+        f.write(f"# Merged into class {max_classes-1} ({len(other_classes)} classes):\n")
+        for orig_class in other_classes[:50]:  # Show first 50
+            f.write(f"{orig_class} -> {max_classes-1}\n")
+        if len(other_classes) > 50:
+            f.write(f"# ... and {len(other_classes) - 50} more classes\n")
     
-    print(f"\n✓ Processed {len(npy_files)} masks with CONSISTENT global mapping")
+    print(f"\n✓ Processed {len(npy_files)} masks with CONSISTENT FREQUENCY-BASED mapping")
     print(f"✓ Saved to {output_dir}")
     print(f"✓ Mapping saved to {mapping_file}")
 
